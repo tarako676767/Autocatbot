@@ -1,132 +1,85 @@
-from __future__ import annotations
-
 from collections.abc import Callable
-import enum
-from typing import TypeVar, Generic
+from typing import Any
 
-from bcsfe import core
+from bcsfe.preset import (
+    LOG_FN,
+    Preset,
+    PresetAction,
+    error,
+    get_field,
+    get_field_default,
+    warn,
+)
 
-T = TypeVar("T")
+from bcsfe import core, __version__
 
+import json
 
-class Combine(enum.Enum):
-    OR = 0
-    AND = 1
-
-
-class CatSelector:
-    def __init__(self, ids: list[int], combine: Combine):
-        self.ids = ids
-        self.combine = combine
-
-    def resolve(self, total_cats: int) -> list[int]:
-        ids: set[int] = set()
-
-        ids.update(range(0, total_cats + 1))
-
-        ids.intersection_update(self.ids)
-
-        return list(ids)
+from bcsfe.preset.cat import CatAction
 
 
-class CatUpgrade:
-    def __init__(
-        self,
-        max_base: bool,
-        max_plus: bool,
-        base: int | None,
-        plus: int | None,
-    ):
-        self.max_base = max_base
-        self.max_plus = max_plus
-        self.base = base
-        self.plus = plus
+def parse_json_file(path: core.Path, log_fn: LOG_FN) -> Preset | None:
+    data = path.read().to_str()
 
-    def apply(self, save_file: core.SaveFile, cat: core.Cat, log_fn: LOG_FN):
-        upgrade = core.Upgrade(-1, -1)
-        if self.max_base:
-            upgrade.base = (
-                core.PowerUpHelper(cat, save_file).get_max_possible_base() - 1
+    return parse_json_str(data, log_fn)
+
+
+def parse_json_str(data: str, log_fn: LOG_FN) -> Preset | None:
+    try:
+        obj = json.loads(data)
+    except json.JSONDecodeError as e:
+        error(log_fn, f"{e}")
+        return None
+
+    schema = get_field(obj, "schema", str, log_fn)
+    if schema is None:
+        return None
+
+    if schema != "1":
+        error(log_fn, f"unsupported schema: {schema}")
+        return None
+
+    editor_version = get_field(obj, "editor_version", str, log_fn)
+    if editor_version is None:
+        return None
+
+    if core.Updater.beta_version_check(editor_version, __version__):
+        error(
+            log_fn,
+            f"unsupported editor version: preset version ({editor_version}) > current version ({__version__})",
+        )
+        return None
+
+    actions_ls = get_field_default(obj, "actions", [], log_fn)
+    if actions_ls is None:
+        return None
+
+    actions: list[PresetAction] = []
+
+    mapping: dict[str, Callable[[Any, LOG_FN], Any]] = {"cat": CatAction.parse}
+
+    for action_obj in actions_ls:
+        action_typ = get_field(action_obj, "type", str, log_fn)
+        if action_typ is None:
+            return None
+
+        action = None
+        fn = mapping.get(action_typ)
+        if fn is None:
+            error(
+                log_fn,
+                f"unrecognised action type: {action_typ}. Expected values: {list(mapping.keys())}",
             )
-        if self.max_plus:
-            upgrade.base = (
-                core.PowerUpHelper(cat, save_file).get_max_possible_plus() - 1
-            )
+            return None
 
-        upgrade.base = (self.base or 0) - 1
-        upgrade.plus = (self.plus or 0) - 1
+        action = fn(action_obj, log_fn)
 
-        cat.set_upgrade(save_file, upgrade)
+        if action is None:
+            return None
 
+        actions.append(PresetAction(action, action.apply))
 
-class CatEdit:
-    def __init__(self, unlock: bool, remove: bool, upgrade: CatUpgrade):
-        self.unlock = unlock
-        self.remove = remove
-        self.upgrade = upgrade
+    if not actions:
+        warn(log_fn, "no actions specified")
 
-    def apply(self, save_file: core.SaveFile, cat: core.Cat, log_fn: LOG_FN):
-        if self.unlock:
-            cat.unlock(save_file)
-        if self.remove:
-            cat.remove(save_file=save_file)
-
-        self.upgrade.apply(save_file, cat, log_fn)
-
-
-LOG_FN = Callable[[str, str], None]
-
-info: Callable[[LOG_FN, str], None] = lambda fn, msg: fn("INFO", msg)
-error: Callable[[LOG_FN, str], None] = lambda fn, msg: fn("ERROR", msg)
-warn: Callable[[LOG_FN, str], None] = lambda fn, msg: fn("WARN", msg)
-
-
-class CatAction:
-    def __init__(self, selectors: list[CatSelector], edit: CatEdit):
-        self.selectors = selectors
-        self.edit = edit
-
-    def resolve_ids(self, total_cats: int, log_fn: LOG_FN) -> list[int]:
-        if not self.selectors:
-            warn(log_fn, "No selectors specified, no cats selected")
-            return []
-
-        first = set(self.selectors[0].resolve(total_cats))
-
-        for other in self.selectors[1:]:
-            ids = other.resolve(total_cats)
-            if other.combine == Combine.OR:
-                first.update(ids)
-            elif other.combine == Combine.AND:
-                first.intersection_update(ids)
-
-        if not first:
-            warn(log_fn, "No cats selected")
-
-        return list(first)
-
-    def apply(self, save_file: core.SaveFile, log_fn: LOG_FN):
-        ids = self.resolve_ids(len(save_file.cats.cats), log_fn)
-
-        for id in ids:
-            cat = save_file.cats.get_cat_by_id(id)
-            if cat is None:
-                warn(log_fn, f"No cat with id: {id}. Skipping...")
-                continue
-
-            self.edit.apply(save_file, log_fn)
-
-
-class PresetAction(enum.Enum):
-    CAT: CatAction
-
-
-class Preset:
-    def __init__(self, schema: str, editor_version: str, actions: list[PresetAction]):
-        self.schema = schema
-        self.editor_version = editor_version
-        self.actions = actions
-
-    def apply(self, save_file: core.SaveFile):
-        for action in self.actions:
-            action.value.apply(save_file)
+    return Preset(schema, editor_version, actions)

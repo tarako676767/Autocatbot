@@ -9,9 +9,9 @@ try:
 except ImportError:
     pass
 
-from bcsfe import core, cli
+from bcsfe import core, cli, preset
 
-__all__ = ["core", "cli"]
+__all__ = ["core", "cli", "preset"]
 
 
 def copy_to_data_dir(base_path: "Traversable", path: "Traversable"):
